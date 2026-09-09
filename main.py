@@ -6,8 +6,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import os
+import re
+import json
+import asyncio
 
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/tmp/ms-playwright"
+os.environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "/opt/render/project/src/.playwright"
+)
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field, field_validator
+
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError
+)
 
 from playwright.async_api import (
     async_playwright,
