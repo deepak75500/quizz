@@ -1,70 +1,33 @@
-import asyncio
-import html
-import json
 import os
 import re
-import hashlib
-from datetime import datetime
+import json
+import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, Field
-from playwright.async_api import async_playwright, Page
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel, Field, field_validator
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-CHATGPT_URL = os.getenv(
-    "CHATGPT_URL",
-    "https://chatgpt.com/"
-)
+APP_NAME = "UGC-NET Web Research API"
 
-DATA_DIR = Path(
-    os.getenv("DATA_DIR", "./cloud_data")
-)
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+OUTPUT_DIR = DATA_DIR / "output"
 
-OUTPUT_DIR = DATA_DIR / "ugcnet_output"
-PROFILE_DIR = DATA_DIR / "chatgpt_profile"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-STORAGE_STATE = Path(
-    os.getenv(
-        "STORAGE_STATE",
-        str(DATA_DIR / "storage_state.json")
-    )
-)
+API_KEY = os.getenv("UGCNET_API_KEY", "")
 
-MAX_WAIT_SECONDS = int(
-    os.getenv("MAX_WAIT_SECONDS", "600")
-)
+PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", "60000"))
 
-NAVIGATION_TIMEOUT = int(
-    os.getenv("NAVIGATION_TIMEOUT", "60000")
-)
-
-API_KEY = os.getenv(
-    "UGCNET_API_KEY",
-    ""
-)
-
-DONE_MARKER = "<UGCNET_JSON_DONE>"
-
-DATA_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-PROFILE_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+research_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -72,12 +35,9 @@ PROFILE_DIR.mkdir(
 # ============================================================
 
 app = FastAPI(
-    title="UGC-NET Original Question Research API",
-    description=(
-        "Searches the web through ChatGPT and extracts "
-        "verified original UGC-NET previous-year questions."
-    ),
-    version="2.0.0"
+    title=APP_NAME,
+    version="1.0.0",
+    description="URL-based UGC-NET research API using Playwright"
 )
 
 
@@ -86,68 +46,62 @@ app = FastAPI(
 # ============================================================
 
 class ResearchRequest(BaseModel):
-
     topic: str = Field(
         ...,
         min_length=1,
-        max_length=500,
-        description="UGC-NET topic or subject area"
+        max_length=500
     )
 
     year: str = Field(
         default="any",
         min_length=1,
-        max_length=100,
-        description=(
-            "Year specification. Examples: "
-            "2019, 2020-2025, 2019,2021,2023, any"
-        )
+        max_length=100
     )
 
     category: str | list[str] = Field(
-        default="MCQ",
-        description=(
-            "Question category. Can be a single category "
-            "or multiple categories."
-        )
+        default="MCQ"
     )
 
     count: int = Field(
         default=20,
         ge=1,
-        le=500,
-        description="Maximum number of verified questions"
+        le=500
     )
 
+    url: str = Field(
+        ...,
+        min_length=5,
+        max_length=5000
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str):
+        value = value.strip()
+
+        if not re.match(
+            r"^https?://",
+            value,
+            re.IGNORECASE
+        ):
+            raise ValueError(
+                "URL must start with http:// or https://"
+            )
+
+        return value
+
 
 # ============================================================
-# GLOBAL LOCK
+# RESPONSE MODEL
 # ============================================================
 
-# Prevent two requests from using the same ChatGPT session
-# simultaneously.
-research_lock = asyncio.Lock()
-
-
-# ============================================================
-# API SECURITY
-# ============================================================
-
-def check_api_key(
-    authorization: str | None
-) -> bool:
-
-    # If UGCNET_API_KEY is not configured,
-    # authentication is disabled.
-    if not API_KEY:
-        return True
-
-    if not authorization:
-        return False
-
-    expected = f"Bearer {API_KEY}"
-
-    return authorization.strip() == expected
+class ResearchResponse(BaseModel):
+    success: bool
+    request: dict[str, Any]
+    page: dict[str, Any]
+    questions: list[dict[str, Any]]
+    count: int
+    generated_at: str
 
 
 # ============================================================
@@ -158,1900 +112,598 @@ def normalize_categories(
     category: str | list[str]
 ) -> list[str]:
 
-    if isinstance(category, list):
-
-        result = []
-
-        for item in category:
-
-            value = str(item).strip()
-
-            if value:
-                result.append(value)
-
-        return result
-
     if isinstance(category, str):
+        values = [category]
+    else:
+        values = category
 
-        value = category.strip()
+    result = []
 
-        if not value:
-            return ["MCQ"]
+    for value in values:
+        value = str(value).strip()
 
-        # Allow:
-        # "MCQ, Graph Based"
-        # "MCQ;Graph Based"
-        if "," in value:
-            parts = value.split(",")
+        if value and value not in result:
+            result.append(value)
 
-        elif ";" in value:
-            parts = value.split(";")
-
-        else:
-            parts = [value]
-
-        result = []
-
-        for item in parts:
-
-            item = item.strip()
-
-            if item:
-                result.append(item)
-
-        return result or ["MCQ"]
-
-    return ["MCQ"]
+    return result or ["MCQ"]
 
 
 # ============================================================
 # YEAR NORMALIZATION
 # ============================================================
 
-def normalize_years(
-    year: str
-) -> list[str]:
+def normalize_year(year: str) -> str:
 
-    value = str(year).strip()
+    year = year.strip()
 
-    if not value:
-        return ["any"]
+    if not year:
+        return "any"
 
-    if value.lower() in {
-        "any",
-        "all",
-        "any year",
-        "all years"
-    }:
-        return ["any"]
-
-    parts = re.split(
-        r"[,;]",
-        value
-    )
-
-    result = []
-
-    for part in parts:
-
-        part = part.strip()
-
-        if part:
-            result.append(part)
-
-    return result or ["any"]
+    return year
 
 
 # ============================================================
-# USER REQUEST DESCRIPTION
+# CREATE RESEARCH DESCRIPTION
 # ============================================================
 
 def create_request_description(
     request: ResearchRequest
-) -> str:
+) -> dict[str, Any]:
 
-    categories = normalize_categories(
-        request.category
-    )
-
-    years = normalize_years(
-        request.year
-    )
-
-    return (
-        f"Topic: {request.topic}\n"
-        f"Year: {', '.join(years)}\n"
-        f"Category: {', '.join(categories)}\n"
-        f"Count: {request.count}"
-    )
+    return {
+        "topic": request.topic.strip(),
+        "year": normalize_year(request.year),
+        "category": normalize_categories(request.category),
+        "count": request.count,
+        "url": request.url.strip()
+    }
 
 
 # ============================================================
-# RESEARCH PROMPT
+# PLAYWRIGHT PAGE EXTRACTION
 # ============================================================
 
-def build_prompt(
-    request: ResearchRequest
-) -> str:
+async def extract_page_content(
+    url: str
+) -> dict[str, Any]:
 
-    categories = normalize_categories(
-        request.category
-    )
+    async with async_playwright() as playwright:
 
-    years = normalize_years(
-        request.year
-    )
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--single-process"
+            ]
+        )
 
-    output_schema = {
-        "request": {
-            "original_request": "",
-            "years_requested": [],
-            "sessions_requested": [],
-            "subjects_requested": [],
-            "papers_requested": [],
-            "topics_requested": [],
-            "question_types_requested": [],
-            "difficulty_requested": [],
-            "question_count_requested": 0
-        },
-        "questions": [
-            {
-                "id": 1,
-                "question": "",
-                "question_type": "",
-                "topic": "",
-                "subject": "",
-                "paper": "",
-                "year": "",
-                "exam_date": "",
-                "session": "",
-                "shift": "",
-                "language": "",
-                "options": {
-                    "A": "",
-                    "B": "",
-                    "C": "",
-                    "D": ""
-                },
-                "correct_answer": "",
-                "correct_option_text": "",
-                "explanation": "",
-                "source_name": "",
-                "source_url": "",
-                "source_type": "",
-                "verified": True,
-                "verification_notes": "",
-                "graph_data": None,
-                "table_data": None,
-                "diagram_data": None
+        context = await browser.new_context(
+            viewport={
+                "width": 1440,
+                "height": 900
+            },
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/139.0.0.0 Safari/537.36"
+            )
+        )
+
+        page = await context.new_page()
+
+        try:
+
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT
+            )
+
+            # Give dynamic pages some time
+            try:
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=15000
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            title = await page.title()
+
+            # Remove elements that normally contain
+            # non-content information.
+            await page.evaluate(
+                """
+                () => {
+                    const selectors = [
+                        'script',
+                        'style',
+                        'noscript',
+                        'svg',
+                        'canvas',
+                        'iframe'
+                    ];
+
+                    for (const selector of selectors) {
+                        document
+                            .querySelectorAll(selector)
+                            .forEach(el => el.remove());
+                    }
+                }
+                """
+            )
+
+            text = await page.locator("body").inner_text(
+                timeout=15000
+            )
+
+            text = clean_text(text)
+
+            html = await page.content()
+
+            final_url = page.url
+
+            status_code = None
+
+            if response:
+                status_code = response.status
+
+            return {
+                "requested_url": url,
+                "final_url": final_url,
+                "title": title,
+                "status_code": status_code,
+                "text": text,
+                "text_length": len(text),
+                "html_length": len(html)
             }
-        ],
-        "statistics": {
-            "requested": 0,
-            "verified_returned": 0,
-            "excluded_unverified": 0,
-            "duplicates_removed": 0,
-            "shortfall": 0
-        }
-    }
 
-    schema_text = json.dumps(
-        output_schema,
-        ensure_ascii=False,
-        indent=2
+        finally:
+
+            await context.close()
+            await browser.close()
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
+def clean_text(text: str) -> str:
+
+    text = text.replace("\r", "\n")
+
+    # Remove excessive spaces
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text
     )
 
-    prompt = f"""
-You are an expert research agent for UGC-NET previous-year
-question papers.
-
-Your task is NOT to generate questions.
-
-Your task is to SEARCH THE WEB and find ACTUAL ORIGINAL
-UGC-NET QUESTIONS that were previously asked in real
-UGC-NET examinations.
-
-============================================================
-USER REQUEST
-============================================================
-
-Topic:
-{request.topic}
-
-Requested year:
-{request.year}
-
-Normalized years:
-{json.dumps(years, ensure_ascii=False)}
-
-Requested categories:
-{json.dumps(categories, ensure_ascii=False)}
-
-Requested count:
-{request.count}
-
-============================================================
-CORE REQUIREMENT
-============================================================
-
-Return ONLY questions that can be verified as genuine
-previous-year UGC-NET questions.
-
-DO NOT:
-
-- invent questions
-- generate similar questions
-- rewrite questions
-- paraphrase questions
-- create synthetic options
-- guess the correct answer
-- invent year
-- invent shift
-- invent exam date
-- invent source URL
-- fabricate graph data
-- fabricate table data
-- fabricate diagram information
-- claim a question is original without evidence
-
-If an exact original question cannot be verified,
-DO NOT return it.
-
-It is better to return fewer verified questions than
-fabricated questions.
-
-============================================================
-WEB RESEARCH
-============================================================
-
-You MUST perform web research.
-
-Search multiple sources where necessary.
-
-Prioritize authoritative sources such as:
-
-1. NTA UGC-NET official website
-2. UGC official previous-question-paper archive
-3. Official NTA answer keys
-4. Official examination documents
-5. Reliable copies of original question papers
-6. Reliable educational archives only when necessary
-
-Useful official domains include:
-
-ugcnet.nta.nic.in
-ugcnet.nta.nic.in/archive/
-ugcnet.nta.nic.in/documents/
-ugcnetonline.in
-
-Do not assume that a search-result snippet proves
-that a question is genuine.
-
-Open and inspect the source.
-
-============================================================
-YEAR REQUIREMENT
-============================================================
-
-The year comes from the user's request.
-
-Requested year:
-{request.year}
-
-If the request is a range such as:
-
-2019-2025
-
-search across that range.
-
-Do not silently replace the requested range with another
-range.
-
-If the user specifies:
-
-2021
-
-do not return 2020 or 2022 questions.
-
-If year is "any", search across available years.
-
-============================================================
-CATEGORY REQUIREMENT
-============================================================
-
-Requested category:
-
-{json.dumps(categories, ensure_ascii=False)}
-
-Possible categories include:
-
-- MCQ
-- Graph Based
-- Table Based
-- Data Interpretation
-- Assertion Reason
-- Statement Based
-- Multiple Statement
-- Matching
-- Numerical
-- Case Based
-- Communication
-- Teaching Aptitude
-- Research Aptitude
-- ICT
-- Logical Reasoning
-- Mathematical Reasoning
-- Higher Education
-- Environment
-- People and Development
-- Reading Comprehension
-- Other
-
-The category must describe the actual question.
-
-Do not change a question into the requested category.
-
-For example, if the source question is graph-based,
-preserve it as graph-based.
-
-============================================================
-EXACT QUESTION
-============================================================
-
-Preserve the original wording as closely as possible.
-
-Do not improve grammar.
-
-Do not simplify wording.
-
-Do not rewrite the question.
-
-Preserve:
-
-- numbers
-- percentages
-- mathematical symbols
-- statements
-- option wording
-- sequences
-- table values
-- graph values
-- labels
-
-Minor OCR correction is allowed only when the source clearly
-contains an OCR error and the original source confirms it.
-
-============================================================
-OPTIONS
-============================================================
-
-Capture ALL original options.
-
-For normal four-option questions:
-
-A
-B
-C
-D
-
-must all be present.
-
-Do not invent a missing option.
-
-For matching questions or questions with special option
-structures, preserve the actual structure.
-
-============================================================
-ANSWER
-============================================================
-
-Find the correct answer from:
-
-- official answer key
-- official response/answer record
-- reliable question paper with answer
-- multiple reliable sources
-
-Do not guess.
-
-If the answer cannot be verified,
-exclude the question.
-
-============================================================
-EXPLANATION
-============================================================
-
-Provide an explanation only after verifying the answer.
-
-The explanation should explain why the correct option is
-correct.
-
-Do not invent an explanation that contradicts the source.
-
-For numerical questions, show the reasoning.
-
-For graph questions, explain the data.
-
-============================================================
-GRAPH QUESTIONS
-============================================================
-
-If the original question contains a graph/chart:
-
-DO NOT generate an image.
-
-Represent the graph as structured JSON data.
-
-Example:
-
-"graph_data": {{
-    "chart_type": "bar",
-    "title": "Example",
-    "x_axis": ["A", "B", "C"],
-    "y_axis": [10, 20, 30],
-    "series": [
-        {{
-            "name": "Value",
-            "data": [10, 20, 30]
-        }}
-    ]
-}}
-
-The values must come from the original question.
-
-Do not estimate values.
-
-If the graph cannot be reliably reconstructed,
-preserve the question and set graph_data to null,
-with an explanation in verification_notes.
-
-============================================================
-TABLE QUESTIONS
-============================================================
-
-If the original question contains a table:
-
-Represent it as:
-
-"table_data": {{
-    "columns": ["Column 1", "Column 2"],
-    "rows": [
-        ["A", "10"],
-        ["B", "20"]
-    ]
-}}
-
-Use only values present in the source.
-
-============================================================
-DIAGRAM QUESTIONS
-============================================================
-
-Do not invent a diagram.
-
-If the diagram contains identifiable structured data,
-represent it in:
-
-"diagram_data"
-
-Otherwise preserve the question and explain the limitation
-in verification_notes.
-
-============================================================
-SOURCE INFORMATION
-============================================================
-
-Every question MUST contain:
-
-source_name
-source_url
-source_type
-verified
-
-source_type should be one of:
-
-- official_nta
-- official_ugc
-- official_answer_key
-- reliable_question_paper
-- reliable_archive
-
-source_url must be a real HTTP/HTTPS URL.
-
-Do not use fake URLs.
-
-============================================================
-DUPLICATES
-============================================================
-
-Remove duplicate questions.
-
-The same question appearing on multiple websites is still
-one question.
-
-Use the strongest available source.
-
-Do not count duplicates as separate questions.
-
-============================================================
-VERIFICATION
-============================================================
-
-Every returned question must have:
-
-"verified": true
-
-If a candidate cannot be verified:
-
-EXCLUDE IT.
-
-Do not return:
-
-"verified": false
-
-as a question.
-
-============================================================
-IMPORTANT ANTI-HALLUCINATION RULE
-============================================================
-
-If you find only 17 verified questions while the user asked
-for 50:
-
-return 17.
-
-DO NOT manufacture the remaining 33.
-
-Set:
-
-statistics.requested = 50
-statistics.verified_returned = 17
-statistics.shortfall = 33
-
-============================================================
-OUTPUT FORMAT
-============================================================
-
-Return ONLY valid JSON.
-
-Do not use Markdown.
-
-Do not write explanations outside JSON.
-
-Do not write:
-
-Here are the questions.
-
-Do not write:
-
-```json
-
-Return exactly one JSON object.
-
-The required structure is:
-
-{schema_text}
-
-============================================================
-FINAL CHECK BEFORE RETURNING
-============================================================
-
-For every question verify:
-
-1. It is an actual UGC-NET question.
-2. The requested year matches.
-3. The topic/category matches.
-4. Original wording is preserved.
-5. All available options are captured.
-6. Correct answer is verified.
-7. Source URL is real.
-8. Source information is included.
-9. It is not a duplicate.
-10. Graph/table/diagram data is not fabricated.
-11. verified is true.
-
-At the very end of the response, after the JSON object,
-append exactly:
-
-{DONE_MARKER}
-
-Nothing else.
-"""
-
-    return prompt
+    # Remove excessive blank lines
+    text = re.sub(
+        r"\n\s*\n+",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
 
 
 # ============================================================
-# FIND CHATGPT INPUT
+# QUESTION EXTRACTION
 # ============================================================
 
-async def find_chatgpt_input(
-    page: Page
-):
+def extract_questions_from_text(
+    text: str,
+    requested_count: int,
+    topic: str,
+    year: str,
+    categories: list[str],
+    source_url: str
+) -> list[dict[str, Any]]:
 
-    selectors = [
-        'textarea[aria-label="Chat with ChatGPT"]',
-        '#mobile-composer-prompt',
-        'textarea.wm-composer-textarea',
-        'textarea[name="prompt"]',
-        'textarea[placeholder="Ask ChatGPT"]',
-        'textarea',
-        '[contenteditable="true"]',
-        '[role="textbox"]'
+    questions = []
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
     ]
 
-    for selector in selectors:
-
-        try:
-
-            locator = page.locator(
-                selector
-            )
-
-            count = await locator.count()
-
-            for i in range(count):
-
-                element = locator.nth(i)
-
-                try:
-
-                    if await element.is_visible():
-
-                        return element
-
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# ASSISTANT MESSAGE LOCATOR
-# ============================================================
-
-async def get_assistant_messages(
-    page: Page
-):
-
-    selectors = [
-        'li[data-message-role="assistant"] [data-assistant-markdown]',
-        '[data-message-author-role="assistant"]',
-        'div[data-message-author-role="assistant"]',
-        'article [data-message-author-role="assistant"]'
-    ]
-
-    for selector in selectors:
-
-        try:
-
-            locator = page.locator(
-                selector
-            )
-
-            if await locator.count() > 0:
-
-                return locator
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# GET ASSISTANT MESSAGE COUNT
-# ============================================================
-
-async def get_assistant_message_count(
-    page: Page
-) -> int:
-
-    locator = await get_assistant_messages(
-        page
-    )
-
-    if locator is None:
-        return 0
-
-    try:
-        return await locator.count()
-
-    except Exception:
-        return 0
-
-
-# ============================================================
-# GET LATEST RESPONSE
-# ============================================================
-
-async def get_latest_response(
-    page: Page
-) -> str:
-
-    locator = await get_assistant_messages(
-        page
-    )
-
-    if locator is None:
-        return ""
-
-    try:
-
-        count = await locator.count()
-
-        if count == 0:
-            return ""
-
-        latest = locator.nth(
-            count - 1
-        )
-
-        text = await latest.inner_text()
-
-        return html.unescape(
-            text or ""
-        )
-
-    except Exception:
-
-        return ""
-
-
-# ============================================================
-# GENERATING CHECK
-# ============================================================
-
-async def is_generating(
-    page: Page
-) -> bool:
-
-    selectors = [
-        'button[aria-label*="Stop"]',
-        'button[aria-label*="stop"]',
-        'button[data-testid*="stop"]',
-        '[data-testid*="stop-generating"]'
-    ]
-
-    for selector in selectors:
-
-        try:
-
-            locator = page.locator(
-                selector
-            )
-
-            if await locator.count() > 0:
-
-                for i in range(
-                    await locator.count()
-                ):
-
-                    try:
-
-                        if await locator.nth(i).is_visible():
-
-                            return True
-
-                    except Exception:
-                        pass
-
-        except Exception:
-            pass
-
-    return False
-
-
-# ============================================================
-# SEND PROMPT
-# ============================================================
-
-async def send_prompt(
-    page: Page,
-    prompt: str
-) -> int:
-
-    # IMPORTANT:
-    # Record assistant-message count BEFORE sending.
-    # This prevents an old answer from being mistaken
-    # for the new research response.
-
-    baseline_count = (
-        await get_assistant_message_count(
-            page
-        )
-    )
-
-    textarea = await find_chatgpt_input(
-        page
-    )
-
-    if textarea is None:
-
-        raise RuntimeError(
-            "ChatGPT input box was not found. "
-            "The login session may have expired."
-        )
-
-    await textarea.click()
-
-    await textarea.fill(
-        prompt
-    )
-
-    print(
-        "Prompt entered."
-    )
-
-    await textarea.press(
-        "Enter"
-    )
-
-    print(
-        "Prompt sent."
-    )
-
-    return baseline_count
-
-
-# ============================================================
-# WAIT FOR RESPONSE
-# ============================================================
-
-async def wait_for_response(
-    page: Page,
-    baseline_count: int
-) -> str:
-
-    start = asyncio.get_running_loop().time()
-
-    last_response = ""
-
-    stable_count = 0
-
-    while True:
-
-        elapsed = (
-            asyncio.get_running_loop().time()
-            - start
-        )
-
-        if elapsed > MAX_WAIT_SECONDS:
-
-            raise TimeoutError(
-                f"ChatGPT response timeout after "
-                f"{MAX_WAIT_SECONDS} seconds."
-            )
-
-        current_count = (
-            await get_assistant_message_count(
-                page
-            )
-        )
-
-        # Wait until a NEW assistant message exists.
-        if current_count <= baseline_count:
-
-            await page.wait_for_timeout(
-                1000
-            )
-
-            continue
-
-        response = await get_latest_response(
-            page
-        )
-
-        if not response:
-
-            await page.wait_for_timeout(
-                1000
-            )
-
-            continue
-
-        print(
-            f"Response received: {len(response)} characters"
-        )
-
-        # Preferred completion condition.
-        if DONE_MARKER in response:
-
-            print(
-                "Completion marker found."
-            )
-
-            return response
-
-        generating = await is_generating(
-            page
-        )
-
-        # If ChatGPT is still generating,
-        # keep waiting.
-        if generating:
-
-            last_response = response
-            stable_count = 0
-
-            await page.wait_for_timeout(
-                1000
-            )
-
-            continue
-
-        # Some UI versions don't expose a generating button.
-        # Detect a stable response.
-        if response == last_response:
-
-            stable_count += 1
-
-        else:
-
-            stable_count = 0
-            last_response = response
-
-        if stable_count >= 5:
-
-            print(
-                "Response appears stable."
-            )
-
-            return response
-
-        await page.wait_for_timeout(
-            1000
-        )
-
-
-# ============================================================
-# EXTRACT JSON
-# ============================================================
-
-def extract_json(
-    response: str
-) -> dict[str, Any]:
-
-    if not response:
-
-        raise ValueError(
-            "Empty ChatGPT response."
-        )
-
-    cleaned = html.unescape(
-        response
-    ).strip()
-
-    # Remove completion marker.
-    cleaned = cleaned.replace(
-        DONE_MARKER,
-        ""
-    ).strip()
-
     # --------------------------------------------------------
-    # 1. Try complete response
+    # Pattern 1:
+    # 1. Question text
     # --------------------------------------------------------
 
-    try:
-
-        data = json.loads(
-            cleaned
-        )
-
-        if isinstance(data, dict):
-            return data
-
-    except Exception:
-        pass
-
-    # --------------------------------------------------------
-    # 2. Markdown JSON code block
-    # --------------------------------------------------------
-
-    code_block_pattern = re.compile(
-        r"```(?:json)?\s*(.*?)\s*```",
-        re.IGNORECASE | re.DOTALL
+    question_pattern = re.compile(
+        r"^(?:Q(?:uestion)?\s*)?(\d{1,4})[\.\):\-]\s*(.+)$",
+        re.IGNORECASE
     )
 
-    blocks = code_block_pattern.findall(
-        cleaned
-    )
+    current_question = None
 
-    for block in blocks:
+    for line in lines:
 
-        try:
-
-            data = json.loads(
-                block
-            )
-
-            if isinstance(data, dict):
-                return data
-
-        except Exception:
-            continue
-
-    # --------------------------------------------------------
-    # 3. Balanced JSON object extraction
-    # --------------------------------------------------------
-
-    start_index = cleaned.find(
-        "{"
-    )
-
-    if start_index == -1:
-
-        raise ValueError(
-            "No JSON object found in ChatGPT response."
-        )
-
-    depth = 0
-    in_string = False
-    escaped = False
-
-    for index in range(
-        start_index,
-        len(cleaned)
-    ):
-
-        char = cleaned[index]
-
-        if in_string:
-
-            if escaped:
-
-                escaped = False
-
-            elif char == "\\":
-
-                escaped = True
-
-            elif char == '"':
-
-                in_string = False
-
-            continue
-
-        if char == '"':
-
-            in_string = True
-
-        elif char == "{":
-
-            depth += 1
-
-        elif char == "}":
-
-            depth -= 1
-
-            if depth == 0:
-
-                candidate = cleaned[
-                    start_index:index + 1
-                ]
-
-                try:
-
-                    data = json.loads(
-                        candidate
-                    )
-
-                    if isinstance(
-                        data,
-                        dict
-                    ):
-                        return data
-
-                except json.JSONDecodeError as e:
-
-                    raise ValueError(
-                        "JSON was found but could not "
-                        f"be decoded: {e}"
-                    )
-
-    raise ValueError(
-        "Could not extract a valid JSON object."
-    )
-
-
-# ============================================================
-# NORMALIZE REQUEST METADATA
-# ============================================================
-
-def normalize_request_metadata(
-    data: dict[str, Any],
-    request: ResearchRequest
-) -> dict[str, Any]:
-
-    categories = normalize_categories(
-        request.category
-    )
-
-    years = normalize_years(
-        request.year
-    )
-
-    data["request"] = {
-        "original_request": create_request_description(
-            request
-        ),
-        "years_requested": years,
-        "sessions_requested": [],
-        "subjects_requested": [],
-        "papers_requested": [],
-        "topics_requested": [
-            request.topic
-        ],
-        "question_types_requested": categories,
-        "difficulty_requested": [],
-        "question_count_requested": request.count
-    }
-
-    return data
-
-
-# ============================================================
-# NORMALIZE ANSWER
-# ============================================================
-
-def normalize_answer(
-    answer: Any
-) -> Any:
-
-    if answer is None:
-        return None
-
-    if isinstance(
-        answer,
-        str
-    ):
-
-        value = answer.strip()
-
-        if not value:
-            return None
-
-        match = re.fullmatch(
-            r"(?:OPTION\s*)?([A-D])",
-            value,
-            re.IGNORECASE
-        )
+        match = question_pattern.match(line)
 
         if match:
 
-            return match.group(
-                1
-            ).upper()
+            if current_question:
 
-        return value
+                questions.append(
+                    current_question
+                )
 
-    return answer
+            number = int(match.group(1))
+            question_text = match.group(2).strip()
 
+            current_question = {
+                "id": number,
+                "question": question_text,
+                "options": {},
+                "correct_answer": None,
+                "explanation": None,
+                "year": year,
+                "category": categories,
+                "topic": topic,
+                "source": {
+                    "url": source_url,
+                    "name": source_url
+                },
+                "verified": False
+            }
 
-# ============================================================
-# NORMALIZE QUESTION TYPE
-# ============================================================
-
-def normalize_question_type(
-    value: Any
-) -> str:
-
-    if value is None:
-        return "MCQ"
-
-    value = str(
-        value
-    ).strip()
-
-    return value or "MCQ"
-
-
-# ============================================================
-# VALIDATE URL
-# ============================================================
-
-def valid_source_url(
-    value: Any
-) -> bool:
-
-    if not isinstance(
-        value,
-        str
-    ):
-        return False
-
-    value = value.strip()
-
-    return (
-        value.startswith("https://")
-        or value.startswith("http://")
-    )
-
-
-# ============================================================
-# VALIDATE QUESTIONS
-# ============================================================
-
-def validate_questions(
-    data: dict[str, Any],
-    request: ResearchRequest
-) -> dict[str, Any]:
-
-    if not isinstance(
-        data,
-        dict
-    ):
-
-        raise ValueError(
-            "Root JSON must be an object."
-        )
-
-    questions = data.get(
-        "questions"
-    )
-
-    if not isinstance(
-        questions,
-        list
-    ):
-
-        raise ValueError(
-            "JSON must contain a questions array."
-        )
-
-    valid_questions = []
-
-    rejected_count = 0
-
-    duplicate_count = 0
-
-    seen = set()
-
-    standard_mcq_types = {
-        "mcq",
-        "graph based",
-        "graph-based",
-        "table based",
-        "table-based",
-        "data interpretation",
-        "statement based",
-        "statement-based",
-        "multiple statement",
-        "multiple-statement",
-        "assertion reason",
-        "assertion-reason"
-    }
-
-    for question in questions:
-
-        if not isinstance(
-            question,
-            dict
-        ):
-
-            rejected_count += 1
-            continue
-
-        # ----------------------------------------------------
-        # Question text
-        # ----------------------------------------------------
-
-        question_text = str(
-            question.get(
-                "question",
-                ""
-            )
-        ).strip()
-
-        if not question_text:
-
-            rejected_count += 1
-            continue
-
-        # ----------------------------------------------------
-        # Verification
-        # ----------------------------------------------------
-
-        verified = question.get(
-            "verified"
-        )
-
-        if verified is not True:
-
-            rejected_count += 1
-            continue
-
-        # ----------------------------------------------------
-        # Source
-        # ----------------------------------------------------
-
-        source_url = question.get(
-            "source_url"
-        )
-
-        if not valid_source_url(
-            source_url
-        ):
-
-            rejected_count += 1
-            continue
-
-        source_name = str(
-            question.get(
-                "source_name",
-                ""
-            )
-        ).strip()
-
-        if not source_name:
-
-            rejected_count += 1
-            continue
-
-        source_type = str(
-            question.get(
-                "source_type",
-                ""
-            )
-        ).strip()
-
-        if not source_type:
-
-            rejected_count += 1
             continue
 
         # ----------------------------------------------------
         # Options
         # ----------------------------------------------------
 
-        options = question.get(
-            "options"
+        option_match = re.match(
+            r"^\(?([A-Da-d])\)?[\.\):\-]\s*(.+)$",
+            line
         )
 
-        if not isinstance(
-            options,
-            dict
-        ):
+        if option_match and current_question:
 
-            rejected_count += 1
+            option_letter = option_match.group(1).upper()
+
+            option_text = option_match.group(2).strip()
+
+            current_question["options"][
+                option_letter
+            ] = option_text
+
             continue
 
-        if len(options) == 0:
+    if current_question:
 
-            rejected_count += 1
-            continue
+        questions.append(current_question)
 
-        # ----------------------------------------------------
-        # Question type
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # Remove duplicate questions
+    # --------------------------------------------------------
 
-        question_type = normalize_question_type(
-            question.get(
-                "question_type"
-            )
-        )
+    unique = []
 
-        type_key = question_type.lower()
+    seen = set()
 
-        # Normal MCQ questions should have A-D.
-        if type_key in standard_mcq_types:
+    for question in questions:
 
-            missing = [
-                option
-                for option in [
-                    "A",
-                    "B",
-                    "C",
-                    "D"
-                ]
-                if option not in options
-            ]
-
-            if missing:
-
-                rejected_count += 1
-                continue
-
-        # ----------------------------------------------------
-        # Answer
-        # ----------------------------------------------------
-
-        correct_answer = normalize_answer(
-            question.get(
-                "correct_answer"
-            )
-        )
-
-        if correct_answer is None:
-
-            rejected_count += 1
-            continue
-
-        # ----------------------------------------------------
-        # Year
-        # ----------------------------------------------------
-
-        year = str(
-            question.get(
-                "year",
-                ""
-            )
-        ).strip()
-
-        if not year:
-
-            rejected_count += 1
-            continue
-
-        # ----------------------------------------------------
-        # Duplicate detection
-        # ----------------------------------------------------
-
-        normalized_text = re.sub(
+        normalized = re.sub(
             r"\s+",
             " ",
-            question_text.lower()
-        )
+            question["question"].lower()
+        ).strip()
 
-        duplicate_key = (
-            normalized_text,
-            year,
-            str(
-                question.get(
-                    "session",
-                    ""
-                )
-            ).strip().lower(),
-            str(
-                question.get(
-                    "shift",
-                    ""
-                )
-            ).strip().lower()
-        )
-
-        if duplicate_key in seen:
-
-            duplicate_count += 1
+        if not normalized:
             continue
 
-        seen.add(
-            duplicate_key
-        )
+        if normalized in seen:
+            continue
 
-        # ----------------------------------------------------
-        # Clean question
-        # ----------------------------------------------------
+        seen.add(normalized)
 
-        clean_question = dict(
-            question
-        )
+        unique.append(question)
 
-        clean_question[
-            "question"
-        ] = question_text
-
-        clean_question[
-            "question_type"
-        ] = question_type
-
-        clean_question[
-            "verified"
-        ] = True
-
-        clean_question[
-            "correct_answer"
-        ] = correct_answer
-
-        clean_question[
-            "source_url"
-        ] = source_url.strip()
-
-        clean_question[
-            "source_name"
-        ] = source_name
-
-        clean_question[
-            "source_type"
-        ] = source_type
-
-        # ----------------------------------------------------
-        # Ensure structured fields exist
-        # ----------------------------------------------------
-
-        for field in [
-            "graph_data",
-            "table_data",
-            "diagram_data"
-        ]:
-
-            if field not in clean_question:
-
-                clean_question[field] = None
-
-            elif (
-                clean_question[field] is not None
-                and not isinstance(
-                    clean_question[field],
-                    dict
-                )
-            ):
-
-                clean_question[field] = None
-
-        valid_questions.append(
-            clean_question
-        )
-
-        # ----------------------------------------------------
-        # Stop at requested count
-        # ----------------------------------------------------
-
-        if len(valid_questions) >= request.count:
-
-            break
-
-    # --------------------------------------------------------
-    # Reassign IDs
-    # --------------------------------------------------------
-
-    for index, question in enumerate(
-        valid_questions,
-        start=1
-    ):
-
-        question["id"] = index
-
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
-
-    returned_count = len(
-        valid_questions
-    )
-
-    shortfall = max(
-        0,
-        request.count - returned_count
-    )
-
-    data["questions"] = (
-        valid_questions
-    )
-
-    data["statistics"] = {
-        "requested": request.count,
-        "verified_returned": returned_count,
-        "excluded_unverified": rejected_count,
-        "duplicates_removed": duplicate_count,
-        "shortfall": shortfall
-    }
-
-    return data
+    return unique[:requested_count]
 
 
 # ============================================================
-# SAVE JSON
+# FIND ANSWERS FROM PAGE
 # ============================================================
 
-def timestamp() -> str:
+def find_answer_for_question(
+    question: dict[str, Any],
+    text: str
+) -> str | None:
 
-    return datetime.now().strftime(
+    question_number = question.get("id")
+
+    # Look for common answer formats
+    patterns = [
+        rf"{question_number}\s*[-:.]?\s*answer\s*[:\-]\s*([A-D])",
+        rf"question\s*{question_number}\s*answer\s*[:\-]\s*([A-D])",
+        rf"q\.?\s*{question_number}\s*answer\s*[:\-]\s*([A-D])"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+            return match.group(1).upper()
+
+    return None
+
+
+# ============================================================
+# VALIDATE QUESTION
+# ============================================================
+
+def validate_question(
+    question: dict[str, Any]
+) -> bool:
+
+    if not question.get("question"):
+        return False
+
+    options = question.get("options")
+
+    if not isinstance(options, dict):
+        return False
+
+    if len(options) < 2:
+        return False
+
+    return True
+
+
+# ============================================================
+# ENRICH QUESTIONS
+# ============================================================
+
+def enrich_questions(
+    questions: list[dict[str, Any]],
+    page_text: str
+) -> list[dict[str, Any]]:
+
+    for question in questions:
+
+        answer = find_answer_for_question(
+            question,
+            page_text
+        )
+
+        if answer:
+            question["correct_answer"] = answer
+            question["verified"] = True
+
+        question["question_type"] = (
+            "MCQ"
+        )
+
+        question["graph_data"] = None
+        question["table_data"] = None
+        question["diagram_data"] = None
+
+    return questions
+
+
+# ============================================================
+# SAVE RESULT
+# ============================================================
+
+def save_result(
+    result: dict[str, Any]
+) -> str:
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime(
         "%Y%m%d_%H%M%S"
     )
 
-
-def save_json(
-    data: dict[str, Any]
-) -> Path:
-
-    file_name = (
-        f"ugcnet_questions_"
-        f"{timestamp()}.json"
+    filename = (
+        f"ugcnet_research_{timestamp}.json"
     )
 
-    output_file = (
-        OUTPUT_DIR / file_name
-    )
+    filepath = OUTPUT_DIR / filename
 
-    with output_file.open(
+    with open(
+        filepath,
         "w",
         encoding="utf-8"
     ) as file:
 
         json.dump(
-            data,
+            result,
             file,
             ensure_ascii=False,
             indent=2
         )
 
-    # Also maintain latest.json
-    latest_file = (
-        OUTPUT_DIR / "latest.json"
-    )
+    latest_file = OUTPUT_DIR / "latest.json"
 
-    with latest_file.open(
+    with open(
+        latest_file,
         "w",
         encoding="utf-8"
     ) as file:
 
         json.dump(
-            data,
+            result,
             file,
             ensure_ascii=False,
             indent=2
         )
 
-    print(
-        f"JSON saved: {output_file}"
-    )
-
-    return output_file
+    return str(filepath)
 
 
 # ============================================================
-# SAVE RAW RESPONSE
+# AUTHENTICATION
 # ============================================================
 
-def save_raw_response(
-    response: str
-) -> Path:
-
-    file_name = (
-        f"raw_response_"
-        f"{timestamp()}.txt"
-    )
-
-    output_file = (
-        OUTPUT_DIR / file_name
-    )
-
-    output_file.write_text(
-        response,
-        encoding="utf-8"
-    )
-
-    return output_file
-
-
-# ============================================================
-# CREATE BROWSER
-# ============================================================
-
-async def create_browser(
-    playwright
+def check_api_key(
+    authorization: str | None
 ):
 
-    chromium = playwright.chromium
+    # If no UGCNET_API_KEY is configured,
+    # authentication is disabled.
+    if not API_KEY:
+        return
 
-    browser = await chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu"
-        ]
-    )
+    if not authorization:
 
-    # --------------------------------------------------------
-    # Authenticated session
-    # --------------------------------------------------------
-
-    if STORAGE_STATE.exists():
-
-        print(
-            f"Using storage state: {STORAGE_STATE}"
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header required"
         )
 
-        context = await browser.new_context(
-            storage_state=str(
-                STORAGE_STATE
-            ),
-            viewport={
-                "width": 1400,
-                "height": 900
-            }
+    if not authorization.startswith(
+        "Bearer "
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Use Bearer authentication"
         )
 
-    else:
+    supplied_key = authorization[
+        len("Bearer "):
+    ].strip()
 
-        print(
-            "WARNING: storage_state.json not found."
+    if supplied_key != API_KEY:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
         )
-
-        context = await browser.new_context(
-            viewport={
-                "width": 1400,
-                "height": 900
-            }
-        )
-
-    return browser, context
 
 
 # ============================================================
 # RESEARCH
 # ============================================================
 
-async def research_ugcnet(
+async def perform_research(
     request: ResearchRequest
-):
+) -> dict[str, Any]:
 
-    prompt = build_prompt(
-        request
+    categories = normalize_categories(
+        request.category
     )
 
-    async with async_playwright() as p:
+    year = normalize_year(
+        request.year
+    )
 
-        browser, context = (
-            await create_browser(p)
+    # --------------------------------------------------------
+    # Open URL
+    # --------------------------------------------------------
+
+    page_data = await extract_page_content(
+        request.url
+    )
+
+    page_text = page_data["text"]
+
+    if not page_text:
+
+        raise RuntimeError(
+            "No readable text was found on the supplied URL"
         )
 
-        try:
+    # --------------------------------------------------------
+    # Extract questions
+    # --------------------------------------------------------
 
-            # ------------------------------------------------
-            # Page
-            # ------------------------------------------------
+    questions = extract_questions_from_text(
+        text=page_text,
+        requested_count=request.count,
+        topic=request.topic,
+        year=year,
+        categories=categories,
+        source_url=page_data["final_url"]
+    )
 
-            if context.pages:
+    # --------------------------------------------------------
+    # Enrich
+    # --------------------------------------------------------
 
-                page = context.pages[0]
+    questions = enrich_questions(
+        questions,
+        page_text
+    )
 
-            else:
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
 
-                page = await context.new_page()
+    valid_questions = []
 
-            page.set_default_timeout(
-                30000
-            )
+    for question in questions:
 
-            print(
-                "Opening ChatGPT..."
-            )
+        if validate_question(question):
 
-            await page.goto(
-                CHATGPT_URL,
-                wait_until="domcontentloaded",
-                timeout=NAVIGATION_TIMEOUT
-            )
+            valid_questions.append(question)
 
-            await page.wait_for_timeout(
-                5000
-            )
+    # --------------------------------------------------------
+    # Result
+    # --------------------------------------------------------
 
-            # ------------------------------------------------
-            # Check login / input
-            # ------------------------------------------------
+    result = {
+        "success": True,
 
-            textarea = await find_chatgpt_input(
-                page
-            )
+        "request": {
+            "topic": request.topic,
+            "year": year,
+            "category": categories,
+            "count": request.count,
+            "url": request.url
+        },
 
-            if textarea is None:
+        "page": {
+            "requested_url": page_data[
+                "requested_url"
+            ],
+            "final_url": page_data[
+                "final_url"
+            ],
+            "title": page_data[
+                "title"
+            ],
+            "status_code": page_data[
+                "status_code"
+            ],
+            "text_length": page_data[
+                "text_length"
+            ]
+        },
 
-                screenshot = (
-                    OUTPUT_DIR
-                    / "chatgpt_login_error.png"
-                )
+        "questions": valid_questions,
 
-                try:
+        "count": len(
+            valid_questions
+        ),
 
-                    await page.screenshot(
-                        path=str(
-                            screenshot
-                        ),
-                        full_page=True
-                    )
+        "generated_at": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
 
-                except Exception:
-                    pass
+    save_result(result)
 
-                raise RuntimeError(
-                    "ChatGPT input was not found. "
-                    "Your storage_state.json may be "
-                    "missing or expired. "
-                    "Create a fresh authenticated "
-                    "Playwright storage state."
-                )
-
-            # ------------------------------------------------
-            # Send
-            # ------------------------------------------------
-
-            baseline_count = (
-                await send_prompt(
-                    page,
-                    prompt
-                )
-            )
-
-            # ------------------------------------------------
-            # Wait
-            # ------------------------------------------------
-
-            response = await wait_for_response(
-                page,
-                baseline_count
-            )
-
-            print(
-                f"Raw response length: {len(response)}"
-            )
-
-            # ------------------------------------------------
-            # Save raw
-            # ------------------------------------------------
-
-            raw_file = save_raw_response(
-                response
-            )
-
-            # ------------------------------------------------
-            # Extract JSON
-            # ------------------------------------------------
-
-            data = extract_json(
-                response
-            )
-
-            # ------------------------------------------------
-            # Force request metadata from API input.
-            # Do not trust the LLM to reproduce these fields.
-            # ------------------------------------------------
-
-            data = normalize_request_metadata(
-                data,
-                request
-            )
-
-            # ------------------------------------------------
-            # Validate
-            # ------------------------------------------------
-
-            data = validate_questions(
-                data,
-                request
-            )
-
-            # ------------------------------------------------
-            # Save
-            # ------------------------------------------------
-
-            output_file = save_json(
-                data
-            )
-
-            return {
-                "success": True,
-                "questions": len(
-                    data["questions"]
-                ),
-                "requested": request.count,
-                "output_file": str(
-                    output_file
-                ),
-                "raw_response_file": str(
-                    raw_file
-                ),
-                "data": data
-            }
-
-        finally:
-
-            try:
-                await context.close()
-            except Exception:
-                pass
-
-            try:
-                await browser.close()
-            except Exception:
-                pass
+    return result
 
 
 # ============================================================
@@ -2059,7 +711,8 @@ async def research_ugcnet(
 # ============================================================
 
 @app.post(
-    "/research"
+    "/research",
+    response_model=ResearchResponse
 )
 async def research(
     request: ResearchRequest,
@@ -2068,104 +721,52 @@ async def research(
     )
 ):
 
-    # --------------------------------------------------------
-    # Authentication
-    # --------------------------------------------------------
-
-    if not check_api_key(
+    check_api_key(
         authorization
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key."
-        )
-
-    # --------------------------------------------------------
-    # Validate topic
-    # --------------------------------------------------------
-
-    if not request.topic.strip():
-
-        raise HTTPException(
-            status_code=400,
-            detail="topic cannot be empty."
-        )
-
-    # --------------------------------------------------------
-    # Validate category
-    # --------------------------------------------------------
-
-    categories = normalize_categories(
-        request.category
     )
 
-    if not categories:
-
-        raise HTTPException(
-            status_code=400,
-            detail="category cannot be empty."
-        )
-
-    # --------------------------------------------------------
-    # Prevent concurrent browser sessions
-    # --------------------------------------------------------
-
-    if research_lock.locked():
-
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "Another UGC-NET research job is "
-                "currently running. Please try again later."
-            )
-        )
-
+    # Prevent multiple Chromium instances
+    # from running simultaneously.
     async with research_lock:
 
         try:
 
-            print(
-                "================================================"
-            )
-
-            print(
-                "NEW UGC-NET RESEARCH REQUEST"
-            )
-
-            print(
-                json.dumps(
-                    request.model_dump(),
-                    ensure_ascii=False,
-                    indent=2
-                )
-            )
-
-            print(
-                "================================================"
-            )
-
-            result = await research_ugcnet(
+            result = await perform_research(
                 request
             )
 
             return result
 
-        except HTTPException:
+        except PlaywrightTimeoutError:
 
-            raise
-
-        except Exception as e:
-
-            print(
-                "ERROR:",
-                repr(e)
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "The supplied URL took too long "
+                    "to load."
+                )
             )
+
+        except Exception as exc:
 
             raise HTTPException(
                 status_code=500,
-                detail=str(e)
+                detail=str(exc)
             )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+async def health():
+
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "playwright": True
+    }
 
 
 # ============================================================
@@ -2176,76 +777,28 @@ async def research(
 async def root():
 
     return {
-        "service":
-            "UGC-NET Original Question Researcher",
-
-        "version":
-            "2.0.0",
-
-        "status":
-            "running",
-
-        "web_research":
-            True,
-
-        "input_format":
-            {
-                "topic": "string",
-                "year": "string",
-                "category": "string or array",
-                "count": "integer"
-            },
-
-        "example": {
-            "topic": "Communication",
-            "year": "2019-2025",
-            "category": [
-                "MCQ",
-                "Graph Based"
-            ],
-            "count": 20
+        "service": APP_NAME,
+        "status": "running",
+        "endpoints": {
+            "research": "POST /research",
+            "health": "GET /health"
         }
     }
 
 
 # ============================================================
-# HEALTH
-# ============================================================
-
-@app.get(
-    "/health"
-)
-async def health():
-
-    return {
-        "status": "ok",
-        "chatgpt_session_configured":
-            STORAGE_STATE.exists(),
-        "storage_state":
-            str(STORAGE_STATE),
-        "output_directory":
-            str(OUTPUT_DIR)
-    }
-
-
-# ============================================================
-# RUN DIRECTLY
+# LOCAL RUN
 # ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8000"
-        )
-    )
-
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=port,
+        port=int(
+            os.getenv("PORT", "8000")
+        ),
         reload=False
     )
