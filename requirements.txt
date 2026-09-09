@@ -3,3 +3,11 @@ uvicorn[standard]
 playwright
 pydantic
 requests
+fastapi
+uvicorn
+requests
+PyMuPDF
+pytesseract
+beautifulsoup4
+Pillow
+python-multipart
