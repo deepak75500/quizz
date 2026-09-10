@@ -1454,7 +1454,7 @@ async def extract_questions(
                     PROFILE_DIR
                 ),
 
-                headless=False,
+                headless=True,
 
                 viewport={
                     "width": 1440,
