@@ -1405,9 +1405,26 @@ def save_json(
 # MAIN
 # ============================================================
 
-async def main():
+async def extract_questions(
+    years: str,
+    number: int,
+    paper: str,
+    difficulty: str
+):
 
-    config = get_user_config()
+    parsed_years = parse_years(years)
+
+    if not parsed_years:
+        raise ValueError("Invalid year input.")
+
+    config = {
+        "years": parsed_years,
+        "number": min(number, 100),
+        "paper": paper or "Paper 1",
+        "difficulty": difficulty.lower()
+    }
+
+    # then your existing Playwright code
 
     print(
         "\nConfiguration:"
@@ -1746,23 +1763,4 @@ async def main():
 # ENTRY POINT
 # ============================================================
 
-if __name__ == "__main__":
 
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "\nStopped by user."
-        )
-
-    except Exception as e:
-
-        print(
-            "\nFatal error:",
-            repr(e)
-        )
