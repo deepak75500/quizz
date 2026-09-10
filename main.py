@@ -1,98 +1,44 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+import traceback
 
 from pp import extract_questions
 
-from pathlib import Path
-from typing import Any
-import os
-import re
-import json
-import asyncio
-
-os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH",
-    "/opt/render/project/src/.playwright"
-)
-
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
-
-from pp import extract_questions
-
-
-app = FastAPI(
-    title="UGC NET Question Extractor API",
-    version="1.0.0"
-)
+app = FastAPI()
 
 
 class ExtractRequest(BaseModel):
-
-    years: str = Field(
-        ...,
-        example="2019"
-    )
-
-    number: int = Field(
-        default=10,
-        ge=1,
-        le=100
-    )
-
-    paper: str = Field(
-        default="Paper 1"
-    )
-
-    difficulty: str = Field(
-        default="mixed"
-    )
-
-    @field_validator("difficulty")
-    @classmethod
-    def validate_difficulty(cls, value):
-
-        value = value.strip().lower()
-
-        if value not in {
-            "easy",
-            "medium",
-            "hard",
-            "mixed"
-        }:
-            raise ValueError(
-                "difficulty must be easy, medium, hard, or mixed"
-            )
-
-        return value
+    years: str
+    number: int = Field(default=10, ge=1, le=100)
+    paper: str = "Political Science"
+    difficulty: str = "mixed"
 
 
 @app.get("/")
 async def root():
-
     return {
         "status": "running",
-        "service": "UGC NET Question Extractor"
+        "service": "UGC NET Question Extraction API"
     }
 
 
 @app.get("/health")
 async def health():
-
-    return {
-        "status": "healthy"
-    }
+    return {"status": "ok"}
 
 
 @app.post("/extract")
 async def extract(request: ExtractRequest):
 
-    try:
+    print("=" * 70)
+    print("EXTRACT REQUEST RECEIVED")
+    print(f"years      = {request.years}")
+    print(f"number     = {request.number}")
+    print(f"paper      = {request.paper}")
+    print(f"difficulty = {request.difficulty}")
+    print("=" * 70)
 
+    try:
         result = await extract_questions(
             years=request.years,
             number=request.number,
@@ -100,22 +46,19 @@ async def extract(request: ExtractRequest):
             difficulty=request.difficulty
         )
 
+        print("EXTRACTION COMPLETED")
+        print(f"Questions returned: {len(result.get('questions', []))}")
+
         return result
 
     except Exception as e:
+        print("=" * 70)
+        print("EXTRACTION ERROR")
+        print(repr(e))
+        traceback.print_exc()
+        print("=" * 70)
 
         raise HTTPException(
             status_code=500,
             detail=str(e)
         )
-
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000
-    )
