@@ -3,7 +3,7 @@ import json
 import re
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from playwright.async_api import async_playwright
 
@@ -13,16 +13,13 @@ from playwright.async_api import async_playwright
 # ============================================================
 
 CHATGPT_URL = "https://chatgpt.com/"
-OUTPUT_FILE = "ugcnet_questions.json"
 
-# Persistent browser profile.
-# Login to ChatGPT manually the first time.
+# Only browser login/session is persisted.
+# NO QUESTION JSON FILE IS SAVED.
 PROFILE_DIR = Path("./chatgpt_profile")
 
 MAX_QUESTIONS_PER_REQUEST = 25
 MAX_RETRIES = 4
-
-# How long to wait for ChatGPT response.
 RESPONSE_TIMEOUT = 180_000
 
 
@@ -31,26 +28,20 @@ RESPONSE_TIMEOUT = 180_000
 # ============================================================
 
 def parse_years(value: str) -> List[int]:
-    """
-    Supports:
-
-        2019
-        2018,2019,2020
-        2015-2020
-        2015-2017,2019,2021-2022
-    """
 
     years = set()
 
     value = value.strip()
 
     for part in value.split(","):
+
         part = part.strip()
 
         if not part:
             continue
 
         if "-" in part:
+
             pieces = part.split("-", 1)
 
             try:
@@ -66,73 +57,13 @@ def parse_years(value: str) -> List[int]:
                 years.add(year)
 
         else:
+
             try:
                 years.add(int(part))
             except ValueError:
                 pass
 
     return sorted(years)
-
-
-def get_user_config():
-
-    print("=" * 70)
-    print("UGC-NET VERIFIED PREVIOUS-YEAR QUESTION EXTRACTOR")
-    print("CHATGPT + PLAYWRIGHT")
-    print("=" * 70)
-
-    years_input = input(
-        "\nYears "
-        "(example: 2019 / 2018,2019 / 2015-2020): "
-    ).strip()
-
-    years = parse_years(years_input)
-
-    if not years:
-        raise ValueError("Invalid year input.")
-
-    number_input = input(
-        "Number of questions (1-100): "
-    ).strip()
-
-    try:
-        number_of_questions = int(number_input)
-    except ValueError:
-        raise ValueError("Question count must be a number.")
-
-    if number_of_questions < 1:
-        raise ValueError("Question count must be at least 1.")
-
-    if number_of_questions > 100:
-        number_of_questions = 100
-
-    paper = input(
-        "Paper/Subject "
-        "(example: Paper 1, Computer Science): "
-    ).strip()
-
-    if not paper:
-        paper = "Paper 1"
-
-    difficulty = input(
-        "Difficulty "
-        "(easy / medium / hard / mixed): "
-    ).strip().lower()
-
-    if difficulty not in {
-        "easy",
-        "medium",
-        "hard",
-        "mixed"
-    }:
-        difficulty = "mixed"
-
-    return {
-        "years": years,
-        "number": number_of_questions,
-        "paper": paper,
-        "difficulty": difficulty,
-    }
 
 
 # ============================================================
@@ -153,6 +84,7 @@ def build_prompt(
     existing_text = ""
 
     if existing_questions:
+
         existing_text = json.dumps(
             [
                 q.get("question", "")
@@ -233,21 +165,13 @@ STRICT VERIFICATION RULES
 For every question you return, verify internally:
 
 1. Was this question actually asked in UGC-NET?
-
 2. What exact year was this question asked?
-
 3. Does that year belong to the requested years?
-
 4. Does the question belong to the requested paper/subject?
-
 5. Can the year be confidently established?
-
 6. Can the original wording be established?
-
 7. Can the original options be established?
-
 8. Can the correct answer be confidently established?
-
 9. Is this question different from questions already returned?
 
 If ANY of these cannot be established confidently:
@@ -298,7 +222,7 @@ If the original evidence identifies:
 
 preserve that information.
 
-If it is not available, use:
+If it is not available:
 
 "session": null
 
@@ -507,7 +431,6 @@ If verification is impossible, return:
 {{
   "questions": []
 }}
-
 """
 
     return prompt
@@ -521,7 +444,6 @@ def clean_json_text(text: str) -> str:
 
     text = text.strip()
 
-    # Remove markdown fences.
     text = re.sub(
         r"^```(?:json)?\s*",
         "",
@@ -535,11 +457,9 @@ def clean_json_text(text: str) -> str:
         text
     )
 
-    # Remove ChatGPT UI artifacts that may surround JSON.
     text = text.replace("\u200b", "")
     text = text.replace("\ufeff", "")
 
-    # Find outer JSON object.
     first = text.find("{")
     last = text.rfind("}")
 
@@ -554,6 +474,7 @@ def extract_json(text: str) -> Dict[str, Any]:
     cleaned = clean_json_text(text)
 
     try:
+
         data = json.loads(cleaned)
 
         if isinstance(data, dict):
@@ -562,7 +483,6 @@ def extract_json(text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # More robust balanced-brace extraction.
     start_positions = [
         m.start()
         for m in re.finditer(r"\{", text)
@@ -597,6 +517,7 @@ def extract_json(text: str) -> Dict[str, Any]:
                 depth += 1
 
             elif char == "}":
+
                 depth -= 1
 
                 if depth == 0:
@@ -604,6 +525,7 @@ def extract_json(text: str) -> Dict[str, Any]:
                     candidate = text[start:i + 1]
 
                     try:
+
                         data = json.loads(candidate)
 
                         if isinstance(data, dict):
@@ -668,10 +590,6 @@ def validate_question(
     year = q.get("year")
     difficulty = q.get("difficulty")
 
-    # --------------------------------------------------------
-    # VERIFICATION IS MANDATORY
-    # --------------------------------------------------------
-
     verification = q.get("verification")
 
     if not isinstance(verification, dict):
@@ -688,10 +606,6 @@ def validate_question(
     if len(reason.strip()) < 10:
         return False
 
-    # --------------------------------------------------------
-    # QUESTION
-    # --------------------------------------------------------
-
     if not isinstance(question, str):
         return False
 
@@ -699,10 +613,6 @@ def validate_question(
 
     if len(question) < 10:
         return False
-
-    # --------------------------------------------------------
-    # OPTIONS
-    # --------------------------------------------------------
 
     if not isinstance(options, dict):
         return False
@@ -718,16 +628,8 @@ def validate_question(
         if not options[option].strip():
             return False
 
-    # --------------------------------------------------------
-    # ANSWER
-    # --------------------------------------------------------
-
     if answer not in {"A", "B", "C", "D"}:
         return False
-
-    # --------------------------------------------------------
-    # YEAR
-    # --------------------------------------------------------
 
     try:
         year = int(year)
@@ -737,20 +639,12 @@ def validate_question(
     if year not in allowed_years:
         return False
 
-    # --------------------------------------------------------
-    # DIFFICULTY
-    # --------------------------------------------------------
-
     if difficulty not in {
         "easy",
         "medium",
         "hard"
     }:
         return False
-
-    # --------------------------------------------------------
-    # PAPER
-    # --------------------------------------------------------
 
     paper = q.get("paper")
 
@@ -761,10 +655,6 @@ def validate_question(
 
         if not paper.strip():
             return False
-
-    # --------------------------------------------------------
-    # SESSION
-    # --------------------------------------------------------
 
     session = q.get("session")
 
@@ -945,16 +835,6 @@ async def get_last_assistant_text(page) -> str:
         except Exception:
             pass
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # ChatGPT may expose the response as:
-    #
-    # <p data-assistant-stream-block="">
-    #
-    # inner_text() normally gives the visible text without
-    # the HTML tags.
-    # --------------------------------------------------------
-
     try:
 
         blocks = page.locator(
@@ -987,7 +867,6 @@ async def get_last_assistant_text(page) -> str:
     except Exception:
         pass
 
-    # Fallback.
     try:
 
         body_text = await page.locator(
@@ -1045,21 +924,16 @@ async def wait_for_response(
         if current != last_text:
 
             last_text = current
-
             stable_count = 0
 
         else:
 
             stable_count += 1
 
-        # Response appears finished when unchanged
-        # several times.
         if stable_count >= 4:
 
             if len(current.strip()) > 20:
                 return current
-
-    return last_text
 
 
 # ============================================================
@@ -1134,7 +1008,6 @@ async def generate_batch(
             "characters"
         )
 
-        # Debug preview.
         print(
             "\nResponse preview:\n",
             response[:1500]
@@ -1161,8 +1034,6 @@ async def generate_batch(
             if questions:
                 return questions
 
-            # If ChatGPT returned zero verified questions,
-            # do NOT force generation.
             print(
                 "No sufficiently verified questions "
                 "were returned."
@@ -1176,7 +1047,7 @@ async def generate_batch(
             )
 
         # ----------------------------------------------------
-        # STRICT RECOVERY PROMPT
+        # RECOVERY PROMPT
         # ----------------------------------------------------
 
         prompt = f"""
@@ -1264,39 +1135,27 @@ Required format:
 
 
 # ============================================================
-# SAVE JSON
+# BUILD RESPONSE JSON
 # ============================================================
 
-def save_json(
-    questions,
-    config
-):
+def build_result(
+    questions: List[Dict[str, Any]],
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
 
-    # Never exceed requested number.
-    questions = questions[
-        :config["number"]
-    ]
+    questions = questions[:config["number"]]
 
     output = {
         "exam": "UGC NET",
-
         "paper": config["paper"],
-
         "years": config["years"],
-
         "requested_questions": config["number"],
-
-        "total_questions": len(
-            questions
-        ),
-
+        "total_questions": len(questions),
         "difficulty": config["difficulty"],
-
         "verification_policy": (
-            "Only questions marked as verified are "
-            "included. Unverified questions are rejected."
+            "Only questions marked as verified are included. "
+            "Unverified questions are rejected."
         ),
-
         "questions": []
     }
 
@@ -1305,104 +1164,29 @@ def save_json(
         start=1
     ):
 
-        item = {
+        output["questions"].append({
             "id": index,
-
             "year": q["year"],
-
             "session": q.get(
                 "session",
                 None
             ),
-
             "paper": q.get(
                 "paper",
                 config["paper"]
             ),
-
             "difficulty": q["difficulty"],
-
             "question": q["question"],
-
             "options": q["options"],
-
             "answer": q["answer"],
-
             "verification": q["verification"]
-        }
+        })
 
-        output["questions"].append(
-            item
-        )
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            output,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    print(
-        "\n" + "=" * 70
-    )
-
-    print(
-        "FINAL RESULT"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "Requested:",
-        config["number"]
-    )
-
-    print(
-        "Verified:",
-        len(questions)
-    )
-
-    print(
-        "Output:",
-        OUTPUT_FILE
-    )
-
-    if len(questions) < config["number"]:
-
-        print(
-            "\nWARNING:"
-        )
-
-        print(
-            "Only verified questions were saved."
-        )
-
-        print(
-            "The program intentionally did NOT "
-            "invent questions to reach the requested count."
-        )
-
-    else:
-
-        print(
-            "\nSUCCESS:"
-        )
-
-        print(
-            "Requested number of verified questions obtained."
-        )
+    return output
 
 
 # ============================================================
-# MAIN
+# MAIN FASTAPI FUNCTION
 # ============================================================
 
 async def extract_questions(
@@ -1415,25 +1199,43 @@ async def extract_questions(
     parsed_years = parse_years(years)
 
     if not parsed_years:
-        raise ValueError("Invalid year input.")
+        raise ValueError(
+            "Invalid year input."
+        )
+
+    number = max(
+        1,
+        min(int(number), 100)
+    )
+
+    difficulty = (
+        difficulty or "mixed"
+    ).lower()
+
+    if difficulty not in {
+        "easy",
+        "medium",
+        "hard",
+        "mixed"
+    }:
+        difficulty = "mixed"
 
     config = {
         "years": parsed_years,
-        "number": min(number, 100),
+        "number": number,
         "paper": paper or "Paper 1",
-        "difficulty": difficulty.lower()
+        "difficulty": difficulty
     }
 
-    # then your existing Playwright code
-
-    print(
-        "\nConfiguration:"
-    )
+    print("=" * 70)
+    print("EXTRACT REQUEST RECEIVED")
+    print("=" * 70)
 
     print(
         json.dumps(
             config,
-            indent=2
+            indent=2,
+            ensure_ascii=False
         )
     )
 
@@ -1442,61 +1244,293 @@ async def extract_questions(
         exist_ok=True
     )
 
-    async with async_playwright() as p:
+    context = None
 
-        print(
-            "\nLaunching Chromium..."
-        )
+    try:
 
-        context = (
-            await p.chromium.launch_persistent_context(
-                user_data_dir=str(
-                    PROFILE_DIR
-                ),
+        async with async_playwright() as p:
 
-                headless=True,
-
-                viewport={
-                    "width": 1440,
-                    "height": 900
-                },
-
-                args=[
-                    "--disable-blink-features=AutomationControlled"
-                ]
+            print(
+                "\nLaunching Chromium..."
             )
-        )
 
-        pages = context.pages
+            context = (
+                await p.chromium.launch_persistent_context(
+                    user_data_dir=str(
+                        PROFILE_DIR
+                    ),
 
-        if pages:
+                    headless=True,
 
-            page = pages[0]
+                    viewport={
+                        "width": 1440,
+                        "height": 900
+                    },
 
-        else:
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage"
+                    ]
+                )
+            )
 
-            page = await context.new_page()
+            pages = context.pages
 
-        print(
-            "Opening ChatGPT..."
-        )
+            if pages:
+                page = pages[0]
+            else:
+                page = await context.new_page()
 
-        await page.goto(
-            CHATGPT_URL,
-            wait_until="domcontentloaded",
-            timeout=120_000
-        )
+            print(
+                "Opening ChatGPT..."
+            )
 
-        await page.wait_for_timeout(
-            5000
-        )
+            await page.goto(
+                CHATGPT_URL,
+                wait_until="domcontentloaded",
+                timeout=120_000
+            )
+
+            await page.wait_for_timeout(
+                5000
+            )
+
+            print(
+                "\nWaiting for ChatGPT..."
+            )
+
+            textarea = None
+
+            for _ in range(120):
+
+                textarea = await find_textarea(
+                    page
+                )
+
+                if textarea is not None:
+                    break
+
+                await page.wait_for_timeout(
+                    1000
+                )
+
+            if textarea is None:
+
+                raise RuntimeError(
+                    "Could not find ChatGPT message input. "
+                    "ChatGPT may require login or its UI may have changed."
+                )
+
+            print(
+                "\nChatGPT is ready."
+            )
+
+            all_questions = []
+
+            target = config["number"]
+
+            batch_number = 1
+
+            # ------------------------------------------------
+            # Generate verified questions
+            # ------------------------------------------------
+
+            while len(all_questions) < target:
+
+                remaining = (
+                    target
+                    - len(all_questions)
+                )
+
+                batch_size = min(
+                    remaining,
+                    MAX_QUESTIONS_PER_REQUEST
+                )
+
+                print(
+                    "\n" + "-" * 70
+                )
+
+                print(
+                    "Progress:",
+                    f"{len(all_questions)}/{target}"
+                )
+
+                print(
+                    "Requesting up to:",
+                    batch_size,
+                    "verified questions"
+                )
+
+                new_questions = await generate_batch(
+                    page=page,
+                    years=config["years"],
+                    paper=config["paper"],
+                    difficulty=config["difficulty"],
+                    count=batch_size,
+                    existing=all_questions,
+                    batch_number=batch_number
+                )
+
+                if not new_questions:
+
+                    print(
+                        "\nNo verified questions "
+                        "received from this batch."
+                    )
+
+                    # ----------------------------------------
+                    # Smaller retry
+                    # ----------------------------------------
+
+                    if batch_size > 5:
+
+                        smaller_size = max(
+                            5,
+                            batch_size // 2
+                        )
+
+                        print(
+                            "Trying smaller batch:",
+                            smaller_size
+                        )
+
+                        new_questions = await generate_batch(
+                            page=page,
+                            years=config["years"],
+                            paper=config["paper"],
+                            difficulty=config["difficulty"],
+                            count=smaller_size,
+                            existing=all_questions,
+                            batch_number=batch_number
+                        )
+
+                    if not new_questions:
+
+                        print(
+                            "\nUnable to obtain another "
+                            "verified batch."
+                        )
+
+                        print(
+                            "Stopping instead of "
+                            "inventing questions."
+                        )
+
+                        break
+
+                # --------------------------------------------
+                # Global duplicate protection
+                # --------------------------------------------
+
+                existing_hashes = {
+                    question_hash(
+                        q["question"]
+                    )
+                    for q in all_questions
+                }
+
+                added = 0
+
+                for q in new_questions:
+
+                    h = question_hash(
+                        q["question"]
+                    )
+
+                    if h not in existing_hashes:
+
+                        all_questions.append(q)
+
+                        existing_hashes.add(h)
+
+                        added += 1
+
+                    if len(all_questions) >= target:
+                        break
+
+                print(
+                    "Verified questions added:",
+                    added
+                )
+
+                print(
+                    "Total verified questions:",
+                    len(all_questions)
+                )
+
+                if added == 0:
+
+                    print(
+                        "\nNo new unique verified "
+                        "questions were added."
+                    )
+
+                    print(
+                        "Stopping to prevent "
+                        "repeated requests."
+                    )
+
+                    break
+
+                batch_number += 1
+
+                await page.wait_for_timeout(
+                    2000
+                )
+
+            # ------------------------------------------------
+            # BUILD JSON IN MEMORY
+            # ------------------------------------------------
+
+            result = build_result(
+                questions=all_questions,
+                config=config
+            )
+
+            print(
+                "\n" + "=" * 70
+            )
+
+            print(
+                "FINAL RESULT"
+            )
+
+            print(
+                "=" * 70
+            )
+
+            print(
+                "Requested:",
+                config["number"]
+            )
+
+            print(
+                "Verified:",
+                len(all_questions)
+            )
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # Return JSON directly.
+            #
+            # NOTHING IS WRITTEN TO:
+            #
+            # ugcnet_questions.json
+            #
+            # ------------------------------------------------
+
+            return result
+
+    except Exception as e:
 
         print(
             "\n" + "=" * 70
         )
 
         print(
-            "CHATGPT LOGIN"
+            "EXTRACTION ERROR"
         )
 
         print(
@@ -1504,263 +1538,16 @@ async def extract_questions(
         )
 
         print(
-            "If ChatGPT asks you to log in, "
-            "log in manually."
+            repr(e)
         )
 
-        print(
-            "The browser profile will remember "
-            "your session."
-        )
+        raise
 
-        print(
-            "Do NOT put your ChatGPT password "
-            "into this script."
-        )
+    finally:
 
-        # ----------------------------------------------------
-        # Wait for ChatGPT input.
-        # ----------------------------------------------------
+        if context is not None:
 
-        for _ in range(120):
-
-            textarea = await find_textarea(
-                page
-            )
-
-            if textarea is not None:
-                break
-
-            await page.wait_for_timeout(
-                1000
-            )
-
-        textarea = await find_textarea(
-            page
-        )
-
-        if textarea is None:
-
-            print(
-                "\nCould not find ChatGPT input."
-            )
-
-            print(
-                "Check the browser and log in manually."
-            )
-
-            await context.close()
-
-            return
-
-        print(
-            "\nChatGPT is ready."
-        )
-
-        all_questions = []
-
-        target = config["number"]
-
-        batch_number = 1
-
-        # ----------------------------------------------------
-        # Generate only verified questions.
-        # ----------------------------------------------------
-
-        while len(all_questions) < target:
-
-            remaining = (
-                target
-                - len(all_questions)
-            )
-
-            batch_size = min(
-                remaining,
-                MAX_QUESTIONS_PER_REQUEST
-            )
-
-            print(
-                "\n" + "-" * 70
-            )
-
-            print(
-                "Progress:",
-                f"{len(all_questions)}/{target}"
-            )
-
-            print(
-                "Requesting up to:",
-                batch_size,
-                "VERIFIED questions"
-            )
-
-            new_questions = await generate_batch(
-                page=page,
-
-                years=config["years"],
-
-                paper=config["paper"],
-
-                difficulty=config["difficulty"],
-
-                count=batch_size,
-
-                existing=all_questions,
-
-                batch_number=batch_number
-            )
-
-            if not new_questions:
-
-                print(
-                    "\nNo verified questions "
-                    "received from this batch."
-                )
-
-                # ------------------------------------------------
-                # Recovery with smaller batch.
-                # ------------------------------------------------
-
-                if batch_size > 5:
-
-                    smaller_size = max(
-                        5,
-                        batch_size // 2
-                    )
-
-                    print(
-                        "Trying smaller verified batch:",
-                        smaller_size
-                    )
-
-                    new_questions = await generate_batch(
-                        page=page,
-
-                        years=config["years"],
-
-                        paper=config["paper"],
-
-                        difficulty=config["difficulty"],
-
-                        count=smaller_size,
-
-                        existing=all_questions,
-
-                        batch_number=batch_number
-                    )
-
-                if not new_questions:
-
-                    print(
-                        "\nUnable to obtain another "
-                        "verified batch."
-                    )
-
-                    print(
-                        "Stopping rather than "
-                        "inventing questions."
-                    )
-
-                    break
-
-            # ----------------------------------------------------
-            # Global duplicate protection.
-            # ----------------------------------------------------
-
-            existing_hashes = {
-                question_hash(
-                    q["question"]
-                )
-                for q in all_questions
-            }
-
-            added = 0
-
-            for q in new_questions:
-
-                h = question_hash(
-                    q["question"]
-                )
-
-                if h not in existing_hashes:
-
-                    all_questions.append(q)
-
-                    existing_hashes.add(h)
-
-                    added += 1
-
-                if len(all_questions) >= target:
-                    break
-
-            print(
-                "Verified questions added:",
-                added
-            )
-
-            print(
-                "Total verified questions:",
-                len(all_questions)
-            )
-
-            # ----------------------------------------------------
-            # Prevent endless loop if ChatGPT repeatedly
-            # produces no new verified questions.
-            # ----------------------------------------------------
-
-            if added == 0:
-
-                print(
-                    "\nNo new unique verified "
-                    "questions were added."
-                )
-
-                print(
-                    "Stopping to prevent "
-                    "repeated requests."
-                )
-
-                break
-
-            batch_number += 1
-
-            await page.wait_for_timeout(
-                2000
-            )
-
-        # ----------------------------------------------------
-        # Save.
-        # ----------------------------------------------------
-
-        save_json(
-            all_questions,
-            config
-        )
-
-        print(
-            "\nBrowser will remain open."
-        )
-
-        print(
-            "Press Ctrl+C to stop."
-        )
-
-        try:
-
-            while True:
-
-                await asyncio.sleep(
-                    3600
-                )
-
-        except KeyboardInterrupt:
-            pass
-
-        await context.close()
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-
+            try:
+                await context.close()
+            except Exception:
+                pass
