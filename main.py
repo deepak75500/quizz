@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import os
 
-PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright
+
 
 import traceback
 from pathlib import Path
