@@ -19,14 +19,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/tmp/ms-playwright"
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError
-)
+from pp import extract_questions
+
+
 app = FastAPI(
     title="UGC NET Question Extractor API",
     version="1.0.0"
@@ -34,6 +32,7 @@ app = FastAPI(
 
 
 class ExtractRequest(BaseModel):
+
     years: str = Field(
         ...,
         example="2019"
@@ -46,18 +45,35 @@ class ExtractRequest(BaseModel):
     )
 
     paper: str = Field(
-        default="Paper 1",
-        example="Paper 1"
+        default="Paper 1"
     )
 
     difficulty: str = Field(
-        default="mixed",
-        example="mixed"
+        default="mixed"
     )
+
+    @field_validator("difficulty")
+    @classmethod
+    def validate_difficulty(cls, value):
+
+        value = value.strip().lower()
+
+        if value not in {
+            "easy",
+            "medium",
+            "hard",
+            "mixed"
+        }:
+            raise ValueError(
+                "difficulty must be easy, medium, hard, or mixed"
+            )
+
+        return value
 
 
 @app.get("/")
 async def root():
+
     return {
         "status": "running",
         "service": "UGC NET Question Extractor"
@@ -66,6 +82,7 @@ async def root():
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy"
     }
