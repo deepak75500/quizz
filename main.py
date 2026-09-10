@@ -20,8 +20,6 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field, field_validator
-
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/tmp/ms-playwright"
 from playwright.async_api import (
     async_playwright,
     TimeoutError as PlaywrightTimeoutError
