@@ -22,3 +22,6 @@ dev = [
     "workers-py",
     "workers-runtime-sdk"
 ]
+
+[tool.setuptools]
+py-modules = ["main", "pp"]
