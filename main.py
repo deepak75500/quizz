@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 import os
 
 
-
+from workers import asgi
 import traceback
 from pathlib import Path
 from typing import Any
@@ -11,7 +11,7 @@ import os
 import re
 import json
 import asyncio
-
+Default = asgi.entrypoint(app)
 
 
 from datetime import datetime, timezone
