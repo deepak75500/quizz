@@ -3,9 +3,6 @@ name = "quizz"
 version = "0.1.0"
 description = "UGC NET Question Extraction API"
 requires-python = ">=3.13"
-dependencies = [
-    "fastapi"
-]
 
 dependencies = [
     "fastapi",
@@ -19,6 +16,7 @@ dependencies = [
     "Pillow",
     "python-multipart"
 ]
+
 [dependency-groups]
 dev = [
     "workers-py",
