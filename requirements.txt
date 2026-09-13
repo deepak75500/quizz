@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+PyMuPDF
+groq
+paddleocr
+paddlepaddle
